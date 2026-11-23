@@ -1,0 +1,888 @@
+#!/usr/bin/env python3
+"""oia —— one-is-all 的任务总表维护与巡检闹钟。
+
+单文件、纯标准库。表就一份 board.md，只有主控写；本工具负责格式、节拍、
+到期计算与闹钟，不做任何业务判断。
+
+用法示例：
+  oia init
+  oia add --title "把评测跑起来" --owner ag-1 --priority P1
+  oia start T01
+  oia tick T01 --ok
+  oia due
+  oia next
+  oia watch          # 后台常驻：到点就退出（退出即唤醒主控）
+  oia archive T01 --artifact path/to/x --verdict "验收通过"
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import re
+import sys
+import time
+from datetime import datetime, timedelta
+
+TS_FMT = "%Y-%m-%d %H:%M:%S"
+DASH = "-"
+ENV_BOARD = "OIA_BOARD"
+
+ACTIVE_COLS = [
+    "ID", "任务", "状态", "负责人", "引用", "节拍", "连检",
+    "上次巡检", "下次巡检", "截止", "最后回执", "里程碑", "下一步", "待定", "优先级",
+]
+ASK_COLS = ["ID", "任务", "事项", "建议", "默认动作", "状态", "回复", "时间"]
+ARCHIVE_COLS = ["ID", "任务", "完成时间", "产出物", "验收结论"]
+
+HEADINGS = {"active": "## 进行中", "ask": "## 待你定", "archive": "## 归档"}
+HEADING_KEYS = {heading: key for key, heading in HEADINGS.items()}
+
+STATES = ["queued", "running", "waiting_you", "blocked", "review", "paused", "done", "dropped"]
+POLLED = {"running", "blocked"}
+
+# 节拍：当前档位 -> (需要连续 N 次无异常, 升到的下一档)
+PROMOTE = {30: (3, 60), 60: (5, 300), 300: (3, 900)}
+BLOCKED_FLOOR = 900
+PROMOTE_AFTER_LONG = 900
+
+INDEX = {name: {col: i for i, col in enumerate(cols)} for name, cols in
+         (("active", ACTIVE_COLS), ("ask", ASK_COLS), ("archive", ARCHIVE_COLS))}
+
+
+# ---------------------------------------------------------------- 基础
+
+def now() -> datetime:
+    return datetime.now().replace(microsecond=0)
+
+
+def fmt(dt: datetime) -> str:
+    return dt.strftime(TS_FMT)
+
+
+def parse_ts(text: str):
+    text = text.strip()
+    if text in ("", DASH):
+        return None
+    try:
+        return datetime.strptime(text, TS_FMT)
+    except ValueError:
+        return None
+
+
+def parse_deadline(text: str) -> str:
+    """接受 +90m / +2h / +1d 或 YYYY-MM-DD HH:MM:SS，返回标准时间串。"""
+    text = text.strip()
+    match = re.fullmatch(r"\+(\d+)([mhd])", text)
+    if match:
+        amount, unit = int(match.group(1)), match.group(2)
+        delta = {"m": timedelta(minutes=amount), "h": timedelta(hours=amount), "d": timedelta(days=amount)}[unit]
+        return fmt(now() + delta)
+    if parse_ts(text) is not None:
+        return fmt(parse_ts(text))
+    die(f"截止格式不对：{text}（用 +90m / +2h / +1d 或 YYYY-MM-DD HH:MM:SS）")
+
+
+def cell(value) -> str:
+    text = str(value)
+    text = text.replace("|", "／").replace("\n", " ").strip()
+    return text or DASH
+
+
+def get(row, section: str, col: str) -> str:
+    index = INDEX[section].get(col)
+    if index is None or index >= len(row):
+        return DASH
+    return row[index]
+
+
+def put(row, section: str, col: str, value) -> None:
+    index = INDEX[section][col]
+    while len(row) <= index:
+        row.append(DASH)
+    row[index] = cell(value)
+
+
+def die(message: str, code: int = 2):
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+# ---------------------------------------------------------------- 读写
+
+def split_row(line: str):
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [part.strip() for part in stripped.split("|")]
+
+
+def is_separator(cells) -> bool:
+    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", part) for part in cells)
+
+
+def read_board(path: str):
+    if not os.path.exists(path):
+        die(f"board 不存在：{path}\n先跑：oia init（或设置 OIA_BOARD）")
+    board = {key: [] for key in HEADINGS}
+    header = {}
+    key = None
+    with open(path, encoding="utf-8") as handle:
+        for raw in handle:
+            line = raw.rstrip("\n")
+            if line.startswith("## "):
+                key = HEADING_KEYS.get(line.strip())
+                continue
+            if key is None or not line.strip().startswith("|"):
+                continue
+            cells = split_row(line)
+            if key not in header:
+                header[key] = cells
+                continue
+            if is_separator(cells):
+                continue
+            board[key].append(cells)
+    return board
+
+
+def render_table(columns, rows) -> str:
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join("---" for _ in columns) + " |",
+    ]
+    for row in rows:
+        cells = [get(row, _section_for(columns), col) for col in columns]
+        lines.append("| " + " | ".join(cell(value) for value in cells) + " |")
+    return "\n".join(lines)
+
+
+def _section_for(columns):
+    if columns is ACTIVE_COLS:
+        return "active"
+    if columns is ASK_COLS:
+        return "ask"
+    return "archive"
+
+
+def write_board(path: str, board) -> None:
+    parts = [
+        "# 任务总表",
+        "",
+        "> 由 `oia` 维护。改表用命令，不要手改；手改后跑 `oia validate`。",
+        "",
+        HEADINGS["active"],
+        "",
+        render_table(ACTIVE_COLS, board["active"]),
+        "",
+        HEADINGS["ask"],
+        "",
+        render_table(ASK_COLS, board["ask"]),
+        "",
+        HEADINGS["archive"],
+        "",
+        render_table(ARCHIVE_COLS, board["archive"]),
+        "",
+    ]
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(parts))
+
+
+def load(path):
+    return read_board(path)
+
+
+def save(path, board):
+    write_board(path, board)
+
+
+# ---------------------------------------------------------------- 查找
+
+def find(board, task_id: str):
+    for row in board["active"]:
+        if get(row, "active", "ID") == task_id:
+            return row
+    return None
+
+
+def need(board, task_id: str):
+    row = find(board, task_id)
+    if row is None:
+        die(f"没有这个任务：{task_id}", 4)
+    return row
+
+
+def next_task_id(board) -> str:
+    used = set()
+    for key in ("active", "archive"):
+        for row in board[key]:
+            match = re.fullmatch(r"T(\d+)", get(row, key, "ID"))
+            if match:
+                used.add(int(match.group(1)))
+    number = 1
+    while number in used:
+        number += 1
+    return f"T{number:02d}"
+
+
+def next_ask_id(board) -> str:
+    used = {get(row, "ask", "ID") for row in board["ask"]}
+    number = 1
+    while f"Q{number:02d}" in used:
+        number += 1
+    return f"Q{number:02d}"
+
+
+# ---------------------------------------------------------------- 节拍
+
+def interval_of(row) -> int:
+    try:
+        value = int(get(row, "active", "节拍"))
+    except ValueError:
+        value = 30
+    return max(value, 1)
+
+
+def idle_of(row) -> int:
+    try:
+        return int(get(row, "active", "连检"))
+    except ValueError:
+        return 0
+
+
+def set_cadence(row, interval: int, idle: int, anchor: datetime) -> None:
+    put(row, "active", "节拍", str(interval))
+    put(row, "active", "连检", str(idle))
+    put(row, "active", "上次巡检", fmt(anchor))
+    put(row, "active", "下次巡检", fmt(anchor + timedelta(seconds=interval)))
+
+
+def promote(row) -> None:
+    interval, idle = interval_of(row), idle_of(row) + 1
+    need, following = PROMOTE.get(interval, (None, None))
+    if need is not None and idle >= need:
+        interval, idle = following, 0
+    put(row, "active", "节拍", str(interval))
+    put(row, "active", "连检", str(idle))
+
+
+def is_polled(row) -> bool:
+    state = get(row, "active", "状态")
+    if state not in POLLED:
+        return False
+    return parse_ts(get(row, "active", "下次巡检")) is not None
+
+
+def due_rows(board, moment=None):
+    moment = moment or now()
+    result = []
+    for row in board["active"]:
+        if not is_polled(row):
+            continue
+        when = parse_ts(get(row, "active", "下次巡检"))
+        if when is not None and when <= moment:
+            result.append(row)
+    return result
+
+
+def next_when(board):
+    times = []
+    for row in board["active"]:
+        if is_polled(row):
+            when = parse_ts(get(row, "active", "下次巡检"))
+            if when is not None:
+                times.append(when)
+    return min(times) if times else None
+
+
+# ---------------------------------------------------------------- 命令
+
+def cmd_init(args):
+    path = args.board
+    if os.path.exists(path) and not args.force:
+        die(f"已存在：{path}（要重建加 --force）")
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    save(path, {key: [] for key in HEADINGS})
+    print(f"已建板：{path}")
+
+
+def cmd_add(args):
+    board = load(args.board)
+    task_id = args.id or next_task_id(board)
+    if find(board, task_id):
+        die(f"ID 已被占用：{task_id}")
+    row = [DASH] * len(ACTIVE_COLS)
+    put(row, "active", "ID", task_id)
+    put(row, "active", "任务", args.title)
+    put(row, "active", "状态", args.state)
+    put(row, "active", "负责人", args.owner or DASH)
+    put(row, "active", "引用", args.ref or DASH)
+    put(row, "active", "截止", parse_deadline(args.deadline) if args.deadline else DASH)
+    put(row, "active", "节拍", str(args.interval) if args.state in POLLED else DASH)
+    put(row, "active", "连检", "0")
+    put(row, "active", "里程碑", args.milestone or DASH)
+    put(row, "active", "下一步", args.next_text or "等派单")
+    put(row, "active", "优先级", args.priority)
+    if args.state == "running":
+        set_cadence(row, args.interval, 0, now())
+    board["active"].append(row)
+    save(args.board, board)
+    print(task_id)
+
+
+def cmd_start(args):
+    board = load(args.board)
+    row = need(board, args.id)
+    put(row, "active", "状态", "running")
+    put(row, "active", "最后回执", fmt(now()) if args.seen_now else get(row, "active", "最后回执"))
+    set_cadence(row, 30, 0, now())
+    save(args.board, board)
+    print(f"{args.id} running，节拍 30s")
+
+
+def cmd_tick(args):
+    board = load(args.board)
+    row = need(board, args.id)
+    stamp = now()
+    if args.anomaly:
+        set_cadence(row, 30, 0, stamp)
+        message = "异常：节拍回落 30s"
+    elif args.seen:
+        put(row, "active", "最后回执", fmt(stamp))
+        message = "已记回执时间"
+    else:
+        promote(row)
+        interval = interval_of(row)
+        put(row, "active", "上次巡检", fmt(stamp))
+        put(row, "active", "下次巡检", fmt(stamp + timedelta(seconds=interval)))
+        message = f"正常：下一跳 {interval}s"
+    save(args.board, board)
+    print(f"{args.id} {message}")
+
+
+def cmd_status(args):
+    if args.state not in STATES:
+        die(f"状态必须是：{', '.join(STATES)}")
+    board = load(args.board)
+    row = need(board, args.id)
+    previous = get(row, "active", "状态")
+    stamp = now()
+    put(row, "active", "状态", args.state)
+
+    if args.state == "running":
+        set_cadence(row, 30, 0, stamp)
+        put(row, "active", "最后回执", fmt(stamp))
+    elif args.state == "blocked":
+        interval = max(interval_of(row), BLOCKED_FLOOR)
+        set_cadence(row, interval, 0, stamp)
+    else:
+        put(row, "active", "连检", "0")
+        put(row, "active", "下次巡检", DASH)
+
+    save(args.board, board)
+    print(f"{args.id} {previous} -> {args.state}")
+
+
+def cmd_set(args):
+    board = load(args.board)
+    row = need(board, args.id)
+    touched = False
+    if args.milestone is not None:
+        put(row, "active", "里程碑", args.milestone)
+        touched = True
+    if args.next is not None:
+        put(row, "active", "下一步", args.next)
+        touched = True
+    if args.pending is not None:
+        put(row, "active", "待定", args.pending)
+        touched = True
+    if args.priority is not None:
+        put(row, "active", "优先级", args.priority)
+        touched = True
+    if args.owner is not None:
+        put(row, "active", "负责人", args.owner)
+        touched = True
+    if args.ref is not None:
+        put(row, "active", "引用", args.ref)
+        touched = True
+    if args.deadline is not None:
+        put(row, "active", "截止", parse_deadline(args.deadline))
+        touched = True
+    if args.interval is not None:
+        interval = max(args.interval, 1)
+        put(row, "active", "节拍", str(interval))
+        put(row, "active", "连检", "0")
+        put(row, "active", "下次巡检", fmt(now() + timedelta(seconds=interval)))
+        touched = True
+    if not touched:
+        die("没有要改的字段")
+    save(args.board, board)
+    print(f"{args.id} 已更新")
+
+
+def cmd_ask(args):
+    board = load(args.board)
+    row = [DASH] * len(ASK_COLS)
+    ask_id = args.id or next_ask_id(board)
+    put(row, "ask", "ID", ask_id)
+    put(row, "ask", "任务", args.task or DASH)
+    put(row, "ask", "事项", args.item)
+    put(row, "ask", "建议", args.advice or DASH)
+    put(row, "ask", "默认动作", args.default or DASH)
+    put(row, "ask", "状态", "open")
+    put(row, "ask", "回复", DASH)
+    put(row, "ask", "时间", DASH)
+    board["ask"].append(row)
+    save(args.board, board)
+    print(ask_id)
+
+
+def logs_dir(board_path: str) -> pathlib.Path:
+    return pathlib.Path(board_path).resolve().parent / "logs"
+
+
+def cmd_log_add(args):
+    board = load(args.board)
+    if find(board, args.id) is None and not any(
+        get(row, "archive", "ID") == args.id for row in board["archive"]
+    ):
+        die(f"没有这个任务：{args.id}", 4)
+    record = {
+        "ts": fmt(now()),
+        "task": args.id,
+        "from": args.actor,
+        "kind": args.kind,
+        "step": args.step,
+        "decision": args.decision,
+        "text": args.text,
+    }
+    target = logs_dir(args.board) / f"{args.id}.jsonl"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    print(f"{args.id} 记录已追加（{args.kind}）")
+
+
+def cmd_log(args):
+    target = logs_dir(args.board) / f"{args.id}.jsonl"
+    rows = []
+    if target.exists():
+        for line in target.read_text(encoding="utf-8").splitlines():
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False))
+    else:
+        for r in rows:
+            print(f"{r.get('ts')} [{r.get('from')}/{r.get('kind')}] {r.get('text','')}")
+    return 0
+
+
+def cmd_decide(args):
+    board = load(args.board)
+    row = None
+    for item in board["ask"]:
+        if get(item, "ask", "ID") == args.id:
+            row = item
+            break
+    if row is None:
+        die(f"没有这一条：{args.id}", 4)
+    state = {"approve": "approved", "reject": "rejected", "question": "questioned"}[args.decision]
+    put(row, "ask", "状态", state)
+    put(row, "ask", "回复", args.text or DASH)
+    put(row, "ask", "时间", fmt(now()))
+    save(args.board, board)
+    print(f"{args.id} -> {state}")
+
+
+def cmd_answer(args):
+    board = load(args.board)
+    row = next((item for item in board["ask"] if get(item, "ask", "ID") == args.id), None)
+    if row is None:
+        die(f"没有这一条：{args.id}", 4)
+    fields = {
+        "批准": args.approve or "",
+        "驳回": args.reject or "",
+        "指导": args.guidance or "",
+        "提问": args.question or "",
+    }
+    if not any(v.strip() for v in fields.values()):
+        die("四个部分至少要填一项")
+    summary = "；".join(f"{k}: {v.strip()}" for k, v in fields.items() if v.strip())
+    put(row, "ask", "状态", "submitted")
+    put(row, "ask", "回复", summary)
+    put(row, "ask", "时间", fmt(now()))
+    save(args.board, board)
+
+    task = get(row, "ask", "任务")
+    if task not in ("", DASH):
+        record = {
+            "ts": fmt(now()),
+            "task": task,
+            "from": "user",
+            "kind": "answer",
+            "step": None,
+            "decision": "question" if fields["提问"].strip() else "approve",
+            "text": summary,
+        }
+        target = logs_dir(args.board) / f"{task}.jsonl"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    print(f"{args.id} 已提交：{summary}")
+
+
+def cmd_resolve(args):
+    board = load(args.board)
+    row = next((item for item in board["ask"] if get(item, "ask", "ID") == args.id), None)
+    if row is None:
+        die(f"没有这一条：{args.id}", 4)
+    put(row, "ask", "状态", "answered")
+    put(row, "ask", "回复", f"主控：{args.text}")
+    put(row, "ask", "时间", fmt(now()))
+    save(args.board, board)
+    task = get(row, "ask", "任务")
+    if task not in ("", DASH):
+        record = {
+            "ts": fmt(now()), "task": task, "from": "leader", "kind": "answer",
+            "step": None, "decision": None, "text": args.text,
+        }
+        target = logs_dir(args.board) / f"{task}.jsonl"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    print(f"{args.id} 已回复")
+
+
+def cmd_submitted(args):
+    board = load(args.board)
+    rows = [row for row in board["ask"] if get(row, "ask", "状态") == "submitted"]
+    if args.json:
+        print(json.dumps([dict(zip(ASK_COLS, row)) for row in rows], ensure_ascii=False))
+    else:
+        print("\n".join(get(row, "ask", "ID") for row in rows) if rows else "NONE")
+    return 0 if rows else 3
+
+
+def cmd_pending(args):
+    board = load(args.board)
+    rows = [row for row in board["ask"] if get(row, "ask", "状态") == "open"]
+    if args.json:
+        print(json.dumps([dict(zip(ASK_COLS, row)) for row in rows], ensure_ascii=False))
+    else:
+        print("\n".join(get(row, "ask", "ID") for row in rows) if rows else "NONE")
+    return 0 if rows else 3
+
+
+def cmd_ask_done(args):
+    board = load(args.board)
+    before = len(board["ask"])
+    board["ask"] = [row for row in board["ask"] if get(row, "ask", "ID") != args.id]
+    if len(board["ask"]) == before:
+        die(f"没有这一条：{args.id}", 4)
+    save(args.board, board)
+    print(f"{args.id} 已清")
+
+
+def cmd_archive(args):
+    board = load(args.board)
+    row = need(board, args.id)
+    title = get(row, "active", "任务")
+    done = [DASH] * len(ARCHIVE_COLS)
+    put(done, "archive", "ID", args.id)
+    put(done, "archive", "任务", title)
+    put(done, "archive", "完成时间", fmt(now()))
+    put(done, "archive", "产出物", args.artifact or DASH)
+    put(done, "archive", "验收结论", args.verdict or DASH)
+    board["archive"].append(done)
+    board["active"] = [item for item in board["active"] if item is not row]
+    save(args.board, board)
+    print(f"{args.id} 已归档")
+
+
+def cmd_due(args):
+    board = load(args.board)
+    rows = due_rows(board)
+    ids = [get(row, "active", "ID") for row in rows]
+    if args.json:
+        print(json.dumps({"due": ids, "count": len(ids)}, ensure_ascii=False))
+    else:
+        print("\n".join(ids) if ids else "NONE")
+    return 0 if ids else 3
+
+
+def cmd_overdue(args):
+    board = load(args.board)
+    ids = []
+    for row in board["active"]:
+        if get(row, "active", "状态") not in POLLED:
+            continue
+        when = parse_ts(get(row, "active", "截止"))
+        if when is not None and when <= now():
+            ids.append(get(row, "active", "ID"))
+    if args.json:
+        print(json.dumps({"overdue": ids, "count": len(ids)}, ensure_ascii=False))
+    else:
+        print("\n".join(ids) if ids else "NONE")
+    return 0 if ids else 3
+
+
+def cmd_next(args):
+    board = load(args.board)
+    when = next_when(board)
+    if when is None:
+        print(json.dumps({"seconds": None}) if args.json else "NONE")
+        return 3
+    seconds = max(0, int((when - now()).total_seconds()))
+    if args.json:
+        print(json.dumps({"seconds": seconds, "at": fmt(when)}, ensure_ascii=False))
+    else:
+        print(seconds)
+    return 0
+
+
+def cmd_watch(args):
+    """常驻到下一个到期点；进程退出即唤醒主控。"""
+    while True:
+        board = load(args.board)
+        when = next_when(board)
+        if when is None:
+            print("NO-ACTIVE")
+            return 3
+        remaining = (when - now()).total_seconds()
+        if remaining <= 0:
+            ids = [get(row, "active", "ID") for row in due_rows(board)]
+            print("DUE " + ",".join(ids))
+            return 0
+        time.sleep(min(remaining, args.poll_seconds))
+
+
+def cmd_show(args):
+    board = load(args.board)
+    row = need(board, args.id)
+    for col in ACTIVE_COLS:
+        print(f"{col}: {get(row, 'active', col)}")
+    return 0
+
+
+def cmd_board(args):
+    board = load(args.board)
+    if args.json:
+        payload = {
+            "now": fmt(now()),
+            "board": args.board,
+            "active": [dict(zip(ACTIVE_COLS, row)) for row in board["active"]],
+            "ask": [dict(zip(ASK_COLS, row)) for row in board["ask"]],
+            "archive": [dict(zip(ARCHIVE_COLS, row)) for row in board["archive"]],
+        }
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    rows = board["active"]
+    if not rows:
+        print("（空）")
+        return 0
+    print(f"{'ID':<5} {'状态':<12} {'节拍':>4} {'下次巡检':<20} 任务")
+    for row in rows:
+        print(f"{get(row, 'active', 'ID'):<5} {get(row, 'active', '状态'):<12} "
+              f"{get(row, 'active', '节拍'):>4} {get(row, 'active', '下次巡检'):<20} "
+              f"{get(row, 'active', '任务')}")
+    if board["ask"]:
+        print(f"\n待你定 {len(board['ask'])} 条")
+    return 0
+
+
+def cmd_validate(args):
+    board = load(args.board)
+    problems = []
+    seen = set()
+    for key in ("active", "ask", "archive"):
+        columns = {"active": ACTIVE_COLS, "ask": ASK_COLS, "archive": ARCHIVE_COLS}[key]
+        for row in board[key]:
+            if len(row) != len(columns):
+                problems.append(f"{key} 行列数 {len(row)} != {len(columns)}：{row[:2]}")
+                continue
+            task_id = get(row, key, "ID")
+            if task_id in seen:
+                problems.append(f"ID 重复：{task_id}")
+            seen.add(task_id)
+        if key == "active":
+            for row in board["active"]:
+                state = get(row, "active", "状态")
+                if state not in STATES:
+                    problems.append(f"{get(row, 'active', 'ID')} 状态非法：{state}")
+                if parse_ts(get(row, "active", "上次巡检")) is None and get(row, "active", "上次巡检") != DASH:
+                    problems.append(f"{get(row, 'active', 'ID')} 上次巡检格式错")
+                if parse_ts(get(row, "active", "下次巡检")) is None and get(row, "active", "下次巡检") != DASH:
+                    problems.append(f"{get(row, 'active', 'ID')} 下次巡检格式错")
+                try:
+                    if int(get(row, "active", "节拍")) < 1:
+                        raise ValueError
+                except ValueError:
+                    problems.append(f"{get(row, 'active', 'ID')} 节拍非正整数")
+    if problems:
+        for problem in problems:
+            print(problem, file=sys.stderr)
+        return 2
+    print("OK")
+    return 0
+
+
+# ---------------------------------------------------------------- 入口
+
+def build_parser() -> argparse.ArgumentParser:
+    default_board = os.environ.get(ENV_BOARD) or os.path.expanduser("~/.one-is-all/board.md")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("-b", "--board", default=default_board, help="board.md 路径")
+
+    parser = argparse.ArgumentParser(prog="oia", description="one-is-all 任务总表")
+    subs = parser.add_subparsers(dest="command", required=True)
+
+    subs.add_parser("init", parents=[common]).add_argument("--force", action="store_true")
+    subs.choices["init"].set_defaults(func=cmd_init)
+
+    add = subs.add_parser("add", parents=[common])
+    add.add_argument("--id")
+    add.add_argument("--title", required=True)
+    add.add_argument("--owner")
+    add.add_argument("--ref", help="run id / thread id / agent id")
+    add.add_argument("--deadline", help="+90m / +2h / +1d 或 时间串")
+    add.add_argument("--priority", default="P2")
+    add.add_argument("--interval", type=int, default=30)
+    add.add_argument("--state", default="queued", choices=STATES)
+    add.add_argument("--milestone")
+    add.add_argument("--next", dest="next_text")
+    add.set_defaults(func=cmd_add)
+
+    start = subs.add_parser("start", parents=[common])
+    start.add_argument("id")
+    start.add_argument("--seen-now", action="store_true")
+    start.set_defaults(func=cmd_start)
+
+    tick = subs.add_parser("tick", parents=[common])
+    tick.add_argument("id")
+    group = tick.add_mutually_exclusive_group(required=True)
+    group.add_argument("--ok", action="store_true")
+    group.add_argument("--anomaly", action="store_true")
+    group.add_argument("--seen", action="store_true")
+    tick.set_defaults(func=cmd_tick)
+
+    status = subs.add_parser("status", parents=[common])
+    status.add_argument("id")
+    status.add_argument("state", choices=STATES)
+    status.set_defaults(func=cmd_status)
+
+    setting = subs.add_parser("set", parents=[common])
+    setting.add_argument("id")
+    setting.add_argument("--milestone")
+    setting.add_argument("--next", dest="next")
+    setting.add_argument("--pending")
+    setting.add_argument("--priority")
+    setting.add_argument("--owner")
+    setting.add_argument("--ref")
+    setting.add_argument("--deadline")
+    setting.add_argument("--interval", type=int)
+    setting.set_defaults(func=cmd_set)
+
+    ask = subs.add_parser("ask", parents=[common])
+    ask.add_argument("--id")
+    ask.add_argument("--task")
+    ask.add_argument("--item", required=True)
+    ask.add_argument("--advice")
+    ask.add_argument("--default")
+    ask.set_defaults(func=cmd_ask)
+
+    log_add = subs.add_parser("log-add", parents=[common])
+    log_add.add_argument("id")
+    log_add.add_argument("--from", dest="actor", required=True, choices=["worker", "leader", "user"])
+    log_add.add_argument("--kind", required=True,
+                         choices=["plan", "step", "report", "verdict", "question", "answer", "note"])
+    log_add.add_argument("--step", type=int)
+    log_add.add_argument("--decision", choices=["approve", "reject", "question"])
+    log_add.add_argument("--text", required=True)
+    log_add.set_defaults(func=cmd_log_add)
+
+    log = subs.add_parser("log", parents=[common])
+    log.add_argument("id")
+    log.add_argument("--json", action="store_true")
+    log.set_defaults(func=cmd_log)
+
+    decide = subs.add_parser("decide", parents=[common])
+    decide.add_argument("id")
+    decide.add_argument("decision", choices=["approve", "reject", "question"])
+    decide.add_argument("--text")
+    decide.set_defaults(func=cmd_decide)
+
+    answer = subs.add_parser("answer", parents=[common])
+    answer.add_argument("id")
+    answer.add_argument("--approve")
+    answer.add_argument("--reject")
+    answer.add_argument("--guidance")
+    answer.add_argument("--question")
+    answer.set_defaults(func=cmd_answer)
+
+    resolve = subs.add_parser("resolve", parents=[common])
+    resolve.add_argument("id")
+    resolve.add_argument("--text", required=True)
+    resolve.set_defaults(func=cmd_resolve)
+
+    submitted = subs.add_parser("submitted", parents=[common])
+    submitted.add_argument("--json", action="store_true")
+    submitted.set_defaults(func=cmd_submitted)
+
+    pending = subs.add_parser("pending", parents=[common])
+    pending.add_argument("--json", action="store_true")
+    pending.set_defaults(func=cmd_pending)
+
+    ask_done = subs.add_parser("ask-done", parents=[common])
+    ask_done.add_argument("id")
+    ask_done.set_defaults(func=cmd_ask_done)
+
+    archive = subs.add_parser("archive", parents=[common])
+    archive.add_argument("id")
+    archive.add_argument("--artifact")
+    archive.add_argument("--verdict")
+    archive.set_defaults(func=cmd_archive)
+
+    due = subs.add_parser("due", parents=[common])
+    due.add_argument("--json", action="store_true")
+    due.set_defaults(func=cmd_due)
+
+    overdue = subs.add_parser("overdue", parents=[common])
+    overdue.add_argument("--json", action="store_true")
+    overdue.set_defaults(func=cmd_overdue)
+
+    nxt = subs.add_parser("next", parents=[common])
+    nxt.add_argument("--json", action="store_true")
+    nxt.set_defaults(func=cmd_next)
+
+    watch = subs.add_parser("watch", parents=[common])
+    watch.add_argument("--poll-seconds", type=float, default=2.0)
+    watch.set_defaults(func=cmd_watch)
+
+    show = subs.add_parser("show", parents=[common])
+    show.add_argument("id")
+    show.set_defaults(func=cmd_show)
+
+    board = subs.add_parser("board", parents=[common])
+    board.add_argument("--json", action="store_true")
+    board.set_defaults(func=cmd_board)
+
+    validate = subs.add_parser("validate", parents=[common])
+    validate.set_defaults(func=cmd_validate)
+
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    return args.func(args) or 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
