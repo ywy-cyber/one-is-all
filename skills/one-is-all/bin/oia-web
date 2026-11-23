@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+"""oia-web —— one-is-all 任务板。
+
+    oia-web [--port 8792] [--host 127.0.0.1] [--board PATH] [--interval 6]
+
+主界面顺序：用户决策点 → 进行中 → 已完成待验收 → 归档。
+每条都是卡片，点进去看详情。主界面只留「直接批准」「直接驳回」；
+详细意见在任务详情页填写，点「提交给主控」才落板。
+"""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import os
+import subprocess
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import quote
+
+ROOT = Path(__file__).resolve().parent
+OIA = ROOT / "oia"
+DEFAULT_BOARD = os.environ.get("OIA_BOARD") or os.path.expanduser("~/.one-is-all/board.md")
+
+STATUS = {
+    "running": ("进行中", "run"),
+    "queued": ("排队", "queue"),
+    "waiting_you": ("等你拍板", "wait"),
+    "blocked": ("受阻", "block"),
+    "review": ("待验收", "review"),
+    "paused": ("暂停", "queue"),
+}
+ASK_STATE = {
+    "open": ("待批复", "wait"),
+    "submitted": ("已提交，等主控", "review"),
+    "answered": ("主控已回", "run"),
+    "approved": ("已批准", "run"),
+    "rejected": ("已驳回", "block"),
+    "questioned": ("已提问", "wait"),
+}
+ROLE = {"worker": "成员", "leader": "主控", "user": "你"}
+KIND = {
+    "plan": "方案", "step": "步骤", "report": "完成报告", "verdict": "裁决",
+    "question": "提问", "answer": "回答", "note": "备注",
+}
+DECISION = {"approve": "批准", "reject": "驳回", "question": "提问"}
+
+CSS = """
+:root{--bg:#ececef;--ink:#3a383f;--muted:#737278;--line:#dcdcde;--card:#fff;
+  --side:#fbfafd;--accent:#1f75cb;--ok:#217645;--no:#dd2b0e;--wait:#ab6100;--rail:#dcdcde}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif}
+a{color:inherit;text-decoration:none}
+.app{display:grid;grid-template-columns:240px 1fr;min-height:100vh}
+.side{background:var(--side);border-right:1px solid var(--line);padding:16px 12px}
+.brand{display:flex;gap:10px;align-items:center;padding:4px 8px 16px}
+.mark{width:32px;height:32px;border-radius:8px;background:#1f75cb;color:#fff;display:grid;place-items:center;font-weight:700}
+.brand b{display:block;font-size:14px}
+.brand small{color:var(--muted);font-size:12px}
+.side h4{margin:14px 8px 6px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.nav a{display:flex;justify-content:space-between;align-items:center;padding:7px 10px;border-radius:6px;color:#3a383f}
+.nav a.on,.nav a:hover{background:#ececef}
+.nav .count{background:#ececef;border-radius:999px;padding:0 7px;font-size:12px;color:var(--muted)}
+.main{background:var(--card);min-width:0}
+.top{display:flex;justify-content:space-between;align-items:center;padding:16px 24px 0}
+.top h1{margin:0;font-size:22px;font-weight:600}
+.sub{color:var(--muted);font-size:12px}
+.tabs{display:flex;gap:4px;padding:12px 24px 0;border-bottom:1px solid var(--line)}
+.tabs a{padding:8px 12px;border-bottom:2px solid transparent;color:var(--muted);font-weight:600}
+.tabs a.on{color:var(--accent);border-color:var(--accent)}
+.content{padding:18px 24px 40px}
+.list{display:flex;flex-direction:column}
+.item{display:grid;grid-template-columns:180px 1fr auto;gap:16px;align-items:start;padding:12px 4px;border-bottom:1px solid var(--line)}
+.item:hover{background:#fbfafd}
+.when{color:var(--muted);font-size:12px}
+.item h3{margin:0 0 4px;font-size:14px;font-weight:600}
+.item p{margin:0;color:var(--muted);font-size:13px}
+.acts{display:flex;gap:8px}
+button{font:13px inherit;border-radius:4px;padding:4px 10px;cursor:pointer;border:1px solid var(--line);background:#fff;color:inherit}
+button.ok{color:var(--ok);border-color:#b7d7c2}
+button.no{color:var(--no);border-color:#f5b8ad}
+button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;background:#ececef;color:#3a383f}
+.pill.run{background:#c3e6cd;color:#0d532a}
+.pill.wait{background:#f5d9a8;color:#6e4500}
+.pill.block{background:#fdd4cd;color:#8d210b}
+.pill.review{background:#cbe2f9;color:#0b5cad}
+.empty{color:var(--muted);padding:18px 0}
+.prompt{border:1px solid var(--line);border-radius:8px;margin:0 0 12px;background:#fff}
+.prompt summary{padding:12px 14px;cursor:pointer;font-weight:600}
+.prompt pre{margin:0;padding:0 14px 14px;white-space:pre-wrap;font:12px/1.55 ui-monospace,Menlo,monospace;color:#3a383f}
+.stage{display:grid;grid-template-columns:minmax(720px,1.35fr) minmax(360px,.75fr);min-height:calc(100vh - 78px)}
+.lanes{padding:18px;border-right:1px solid var(--line);overflow:auto;background:#fbfafd}
+.lanehead,.band{display:grid;grid-template-columns:1fr 92px 1fr 92px 1fr}
+.lanehead{font-size:12px;font-weight:600;color:var(--muted);margin-bottom:6px}
+.lanehead span:nth-child(odd){padding-left:30px}
+.rail{position:relative;min-height:74px;padding:12px 8px 12px 34px}
+.rail:before{content:"";position:absolute;left:12px;top:0;bottom:0;width:2px;background:var(--rail)}
+.band:first-of-type .rail:before{top:16px}
+.node{position:relative;border:0;background:transparent;padding:0;text-align:left;color:inherit;font:inherit;width:100%;cursor:pointer}
+.node .dot{position:absolute;left:-28px;top:2px;width:12px;height:12px;border-radius:50%;background:#fff;border:2px solid var(--accent)}
+.node.on .dot{background:var(--accent)}
+.node .nt{display:block;font-weight:600}
+.node .ns{display:block;color:var(--muted);font-size:12px;margin-top:2px}
+.node .bang{position:absolute;top:-8px;left:-10px;width:16px;height:16px;border-radius:50%;background:var(--no);color:#fff;font:700 11px/16px sans-serif;text-align:center}
+.bridge{position:relative;display:flex;align-items:center}
+.bridge:before{content:"";position:absolute;left:6px;right:6px;top:50%;height:2px;background:var(--rail)}
+.bridge:after{content:"";position:absolute;right:4px;top:calc(50% - 4px);border:5px solid transparent;border-left:7px solid #89888d}
+.bridge .node{background:#fff;border:1px solid var(--line);border-radius:4px;padding:3px 7px;font-size:12px;z-index:1}
+.detail{padding:20px 22px;overflow:auto}
+.detail h3{margin:0 0 4px;font-size:18px}
+.detail .who{color:var(--muted);font-size:12px;margin-bottom:12px}
+.detail .body{white-space:pre-wrap}
+.formgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.formgrid .full{grid-column:1 / -1}
+label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px}
+textarea{width:100%;min-height:68px;border:1px solid var(--line);border-radius:4px;padding:7px 8px;font:inherit;color:inherit}
+.note{background:#e9f3fc;color:#0b5cad;border-radius:4px;padding:8px 12px;margin-bottom:12px}
+"""
+
+
+def esc(v) -> str:
+    return html.escape("" if v is None else str(v))
+
+
+def run_oia(args: list[str], board: str) -> subprocess.CompletedProcess:
+    env = {**os.environ, "OIA_BOARD": board}
+    return subprocess.run([str(OIA), *args], capture_output=True, text=True, env=env, timeout=15)
+
+
+def fetch_board(board: str) -> dict:
+    proc = run_oia(["board", "--json"], board)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "oia board 失败")
+    return json.loads(proc.stdout)
+
+
+def fetch_log(board: str, tid: str) -> list:
+    proc = run_oia(["log", tid, "--json"], board)
+    if proc.returncode != 0:
+        return []
+    try:
+        return json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+
+
+def submit_answer(board: str, qid: str, payload: dict) -> None:
+    args = ["answer", qid]
+    for key, flag in (("approve", "--approve"), ("reject", "--reject"), ("guidance", "--guidance"), ("question", "--question")):
+        if payload.get(key):
+            args += [flag, payload[key]]
+    proc = run_oia(args, board)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "oia answer 失败")
+
+
+def pill(state: str, table=STATUS) -> str:
+    label, kind = table.get(state, (state, "queue"))
+    return f'<span class="pill {kind}">{esc(label)}</span>'
+
+
+def overdue(row: dict, now: str) -> bool:
+    deadline = str(row.get("截止", "-"))
+    return deadline not in ("", "-") and deadline < now
+
+
+def task_index(board: dict) -> dict:
+    # 归档必须盖过进行中的同名残留，否则详情页会显示成还在跑、历史像消失了。
+    idx = {}
+    for row in board.get("archive", []):
+        idx[row.get("ID")] = row
+    for row in board.get("active", []):
+        idx[row.get("ID")] = row
+    return idx
+
+
+PROMPTS = [("LEADER.md", "主控规程"), ("WORKER.md", "成员规程"), ("SCHEDULING.md", "调度清单"), ("SKILL.md", "入口")]
+
+
+def read_prompt(name: str) -> str:
+    path = ROOT.parent / name
+    return path.read_text(encoding="utf-8") if path.exists() else "（没有这份文件）"
+
+
+def app_shell(title: str, nav: str, body: str, refresh: int | None = None) -> str:
+    meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
+    return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">{meta}
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)}</title>
+<style>{CSS}</style></head><body><div class="app">{nav}{body}</div></body></html>"""
+
+
+def sidenav(active: str, open_count: int = 0) -> str:
+    badge = f'<span class="count">{open_count}</span>' if open_count else ""
+    board_on = "on" if active == "board" else ""
+    prompt_on = "on" if active == "prompts" else ""
+    return f"""<aside class="side">
+  <div class="brand"><div class="mark">O</div><div><b>one-is-all</b><small>任务与提示词</small></div></div>
+  <h4>项目</h4>
+  <nav class="nav">
+    <a class="{prompt_on}" href="/prompts"><span>提示词管理</span></a>
+    <a class="{board_on}" href="/"><span>任务面板</span>{badge}</a>
+  </nav>
+</aside>"""
+
+
+def render_prompts() -> str:
+    blocks = "".join(
+        f'<details class="prompt" open><summary>{esc(label)} · {esc(name)}</summary><pre>{esc(read_prompt(name)[:12000])}</pre></details>'
+        for name, label in PROMPTS
+    )
+    body = f"""<main class="main"><div class="top"><div><h1>提示词管理</h1><div class="sub">改源文件后刷新即可。</div></div></div>
+<div class="content">{blocks}</div></main>"""
+    return app_shell("提示词管理", sidenav("prompts"), body)
+
+
+def task_row(row: dict, now: str) -> str:
+    tid = row.get("ID", "")
+    deadline = row.get("截止", "-")
+    extra = f' · 截止 {esc(deadline)}' if deadline not in ("", "-") else ""
+    return f"""<a class="item" href="/task/{quote(tid)}">
+  <div class="when">{esc(tid)} · {esc(row.get("负责人","-"))}{extra}</div>
+  <div><h3>{esc(row.get("任务",""))}</h3><p>下一步 {esc(row.get("下一步","-"))}</p></div>
+  <div>{pill(row.get("状态",""))}</div></a>"""
+
+
+def decision_row(q: dict, idx: dict) -> str:
+    qid = q.get("ID", "")
+    tid = q.get("任务", "-")
+    task = idx.get(tid, {})
+    where = "全局" if tid in ("", "-") else f'{tid} · {task.get("任务", "")}'
+    state = q.get("状态", "open")
+    label, kind = ASK_STATE.get(state, (state, "queue"))
+    href = f'/task/{quote(tid)}' if tid not in ("", "-") else "/"
+    actions = ""
+    if state == "open":
+        actions = (
+            f'<div class="acts"><button class="ok" data-quick="{quote(qid)}" data-kind="approve">直接批准</button>'
+            f'<button class="no" data-quick="{quote(qid)}" data-kind="reject">直接驳回</button></div>'
+        )
+    return f"""<div class="item"><div class="when">{esc(qid)}<br>{esc(where)}</div>
+  <div><a href="{href}"><h3>{esc(q.get("事项",""))}</h3></a>
+  <p>建议 {esc(q.get("建议","-"))} · 默认 {esc(q.get("默认动作","-"))}</p>{actions}</div>
+  <div><span class="pill {kind}">{esc(label)}</span></div></div>"""
+
+
+def render_index(data: dict, interval: int, flash: str, tab: str = "decisions") -> str:
+    active = data.get("active", [])
+    asks = data.get("ask", [])
+    archive = data.get("archive", [])
+    now = data.get("now", "")
+    idx = task_index(data)
+    open_asks = [a for a in asks if a.get("状态") == "open"]
+    running = [r for r in active if r.get("状态") in ("running", "queued", "blocked", "paused", "waiting_you")]
+    review = [r for r in active if r.get("状态") == "review"]
+    tabs = [("decisions", "用户决策点", len(open_asks)), ("running", "进行中", len(running)),
+            ("review", "待验收", len(review)), ("archive", "归档", len(archive))]
+    tab_html = "".join(f'<a class="{"on" if tab == key else ""}" href="/?tab={key}">{label} {n}</a>' for key, label, n in tabs)
+    if tab == "running":
+        content = "".join(task_row(r, now) for r in running) or '<div class="empty">没有在跑的任务。</div>'
+    elif tab == "review":
+        content = "".join(task_row(r, now) for r in review) or '<div class="empty">没有待验收的任务。</div>'
+    elif tab == "archive":
+        content = "".join(
+            f'<a class="item" href="/task/{quote(r.get("ID",""))}"><div class="when">{esc(r.get("完成时间",""))}</div>'
+            f'<div><h3>{esc(r.get("任务",""))}</h3><p>{esc(r.get("验收结论","-"))}</p></div><div>{esc(r.get("ID",""))}</div></a>'
+            for r in archive[:60]
+        ) or '<div class="empty">还没有归档。</div>'
+    else:
+        content = "".join(decision_row(q, idx) for q in open_asks) or '<div class="empty">没有等你的事。</div>'
+    body = f"""<main class="main"><div class="top"><div><h1>任务面板</h1>
+<div class="sub">{esc(data.get("board",""))} · 同步于 {esc(now)} · 每 {interval}s 重读任务表</div></div></div>
+<nav class="tabs">{tab_html}</nav><div class="content">{f'<div class="note">{esc(flash)}</div>' if flash else ''}<div class="list">{content}</div></div></main>"""
+    return app_shell("任务面板", sidenav("board", len(open_asks)), body, interval)
+
+
+def title_of(row: dict) -> str:
+    text = str(row.get("text") or "").strip().splitlines()[0] if row.get("text") else ""
+    kind = KIND.get(row.get("kind", ""), row.get("kind", ""))
+    step = f"第{row['step']}步" if row.get("step") else ""
+    head = " ".join(x for x in (kind, step) if x)
+    return (text[:18] or head or "记录")
+
+
+def lane_rows(logs: list, asks: list) -> list:
+    """三条链：成员执行 / 主控反馈 / 你。箭头是向右的汇报。"""
+    rows = []
+    pending_worker = None
+    pending_leader = None
+    for i, rec in enumerate(logs):
+        who = rec.get("from") or "worker"
+        node = {"id": f"L{i}", "title": title_of(rec), "text": rec.get("text") or "", "meta": rec.get("ts") or "", "open": False, "qid": ""}
+        if who == "worker":
+            if pending_worker:
+                rows.append(pending_worker)
+            pending_worker = {"worker": node, "to_leader": None, "leader": None, "to_user": None, "user": None}
+        elif who == "leader":
+            if pending_worker and not pending_worker["leader"]:
+                pending_worker["to_leader"] = title_of(pending_worker["worker"])
+                pending_worker["leader"] = node
+                pending_leader = pending_worker
+                pending_worker = None
+            else:
+                rows.append({"worker": None, "to_leader": None, "leader": node, "to_user": None, "user": None})
+                pending_leader = rows[-1]
+        else:
+            if pending_leader and not pending_leader["user"]:
+                pending_leader["to_user"] = title_of(pending_leader["leader"] or {"text": "呈报"})
+                pending_leader["user"] = node
+                pending_leader = None
+            else:
+                rows.append({"worker": None, "to_leader": None, "leader": None, "to_user": None, "user": node})
+    if pending_worker:
+        rows.append(pending_worker)
+    for q in asks:
+        qid = q.get("ID", "")
+        label, _ = ASK_STATE.get(q.get("状态", "open"), (q.get("状态"), "queue"))
+        node = {
+            "id": f"Q{qid}",
+            "title": str(q.get("事项") or "待你定")[:18],
+            "text": f"事项：{q.get('事项','-')}\n建议：{q.get('建议','-')}\n默认：{q.get('默认动作','-')}\n状态：{label}\n回复：{q.get('回复','-')}",
+            "meta": q.get("时间") or "",
+            "open": q.get("状态") == "open",
+            "qid": qid if q.get("状态") == "open" else "",
+        }
+        rows.append({"worker": None, "to_leader": None, "leader": {"id": f"Qin{qid}", "title": "呈报给你", "text": q.get("事项") or "", "meta": "", "open": False, "qid": ""}, "to_user": "请你定", "user": node})
+    return rows
+
+
+def node_btn(node) -> str:
+    if not node:
+        return '<div class="rail"></div>'
+    bang = '<i class="bang">!</i>' if node.get("open") else ""
+    payload = json.dumps({"title": node["title"], "meta": node["meta"], "text": node["text"], "qid": node.get("qid") or ""}, ensure_ascii=False)
+    return (
+        f'<div class="rail"><button class="node" type="button" data-node=\'{html.escape(payload, quote=True)}\'>'
+        f'<i class="dot"></i>{bang}<span class="nt">{esc(node["title"])}</span><span class="ns">{esc(node["meta"])}</span></button></div>'
+    )
+
+
+def arrow_btn(label: str, node) -> str:
+    if not node:
+        return "<div></div>"
+    payload = json.dumps({"title": label, "meta": node.get("meta") or "", "text": node.get("text") or "", "qid": ""}, ensure_ascii=False)
+    return (
+        f'<div class="bridge"><button class="node arrow-node" type="button" data-node=\'{html.escape(payload, quote=True)}\'>'
+        f'<span class="nt">{esc(label)}</span></button></div>'
+    )
+
+
+def render_flow(logs: list, asks: list) -> str:
+    bands = []
+    for row in lane_rows(logs, asks):
+        left = arrow_btn("汇报", row["worker"]) if row.get("to_leader") else "<div></div>"
+        right = arrow_btn("呈报", row["leader"]) if row.get("to_user") else "<div></div>"
+        bands.append("<div class=\"band\">" + node_btn(row["worker"]) + left + node_btn(row["leader"]) + right + node_btn(row["user"]) + "</div>")
+    if not bands:
+        return '<div class="empty">还没有交互。成员提方案后，会出现在最左链。</div>'
+    return '<div class="lanehead"><span>成员</span><span></span><span>主控</span><span></span><span>你</span></div><div class="flow">' + "".join(bands) + "</div>"
+
+
+DETAIL_JS = """
+<script>
+(function(){
+  const box = document.getElementById('detail');
+  const form = document.getElementById('decide');
+  function show(node){
+    document.querySelectorAll('.node').forEach(function(el){ el.classList.remove('on'); });
+    node.classList.add('on');
+    const data = JSON.parse(node.getAttribute('data-node'));
+    box.querySelector('h3').textContent = data.title || '记录';
+    box.querySelector('.who').textContent = data.meta || '';
+    box.querySelector('.body').textContent = data.text || '（没有正文）';
+    if (data.qid) { form.hidden = false; form.setAttribute('data-qid', data.qid); }
+    else { form.hidden = true; form.removeAttribute('data-qid'); }
+  }
+  document.querySelectorAll('.node').forEach(function(el){
+    el.addEventListener('click', function(){ show(el); });
+  });
+  const first = document.querySelector('.node');
+  if (first) show(first);
+  const btn = document.getElementById('submit');
+  if (!btn) return;
+  btn.addEventListener('click', async function(){
+    const qid = form.getAttribute('data-qid');
+    if (!qid) return;
+    const item = {};
+    ['approve','reject','guidance','question'].forEach(function(k){
+      const el = form.querySelector('[name="'+k+'"]');
+      if (el && el.value.trim()) item[k] = el.value.trim();
+    });
+    if (!Object.keys(item).length) { alert('先填写一项'); return; }
+    btn.disabled = true; btn.textContent = '提交中…';
+    const r = await fetch('/submit', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({items: {[qid]: item}})});
+    if (r.ok) location.href = location.pathname + '?submitted=1';
+    else { alert('提交失败：' + await r.text()); btn.disabled = false; btn.textContent = '提交'; }
+  });
+})();
+</script>
+"""
+
+
+def render_task(data: dict, tid: str, flash: str) -> str:
+    idx = task_index(data)
+    row = idx.get(tid)
+    if not row:
+        return app_shell("没有这个任务", sidenav("board"), f'<main class="main"><div class="content"><h1>没有 {esc(tid)}</h1><a href="/">返回</a></div></main>')
+    logs = fetch_log(data.get("board", ""), tid)
+    asks = [q for q in data.get("ask", []) if q.get("任务") == tid]
+    body = f"""<div class="wrap">
+<div class="crumb"><a href="/">← 任务板</a> / {esc(tid)} · {esc(row.get("任务", tid))}</div>
+{f'<div class="note">{esc(flash)}</div>' if flash else ''}
+<div class="stage">
+  <div class="lanes">{render_flow(logs, asks)}</div>
+  <div class="detail" id="detail">
+    <h3>选一个节点</h3>
+    <div class="who"></div>
+    <div class="body">左侧链上的点、向右的箭头，都只显示标题。点开后在这里看全文。</div>
+    <form id="decide" hidden>
+      <div class="formgrid">
+        <div><label>批准部分（1 = 全部，留空 = 不批）</label><textarea name="approve"></textarea></div>
+        <div><label>驳回部分（1 = 全部，留空 = 无）</label><textarea name="reject"></textarea></div>
+        <div><label>指导意见（留空则主控自己判断）</label><textarea name="guidance"></textarea></div>
+        <div><label>提出问题（只交互，不执行）</label><textarea name="question"></textarea></div>
+        <div class="full"><button class="primary" id="submit" type="button">提交</button></div>
+      </div>
+    </form>
+  </div>
+</div>
+</div>{DETAIL_JS}"""
+    return app_shell(f"{tid} · 任务板", sidenav("board"), f'<main class="main">{body}</main>')
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        sys.stderr.write("[oia-web] " + fmt % args + "\n")
+
+    def _send(self, text: str, ctype: str, code: int = 200):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.end_headers()
+        self.wfile.write(text.encode())
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        try:
+            if path == "/health":
+                self.send_response(200); self.end_headers(); self.wfile.write(b"ok"); return
+            if path == "/api/board":
+                self._send(json.dumps(fetch_board(self.server.board_path), ensure_ascii=False), "application/json; charset=utf-8")
+                return
+            data = fetch_board(self.server.board_path)
+            if path == "/prompts":
+                self._send(render_prompts(), "text/html; charset=utf-8")
+            elif path == "/":
+                flash = "已提交给主控。" if "submitted=1" in self.path else ""
+                tab = self.path.split("tab=", 1)[1].split("&")[0] if "tab=" in self.path else "decisions"
+                self._send(render_index(data, self.server.interval, flash, tab), "text/html; charset=utf-8")
+            elif path.startswith("/task/"):
+                flash = "已提交给主控，先写进任务板。" if "submitted=1" in self.path else ""
+                self._send(render_task(data, path[len("/task/"):], flash), "text/html; charset=utf-8")
+            else:
+                self._send(app_shell("404", sidenav("board"), '<main class="main"><h1>404</h1></main>'), "text/html; charset=utf-8", 404)
+        except Exception as exc:  # noqa: BLE001
+            self._send(app_shell("出错", sidenav("board"), f'<main class="main"><h1>读取失败</h1><pre>{esc(exc)}</pre></main>'), "text/html; charset=utf-8", 500)
+
+    def do_POST(self):
+        if self.path.split("?", 1)[0] != "/submit":
+            self._send("not found", "text/plain; charset=utf-8", 404)
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            payload = json.loads(self.rfile.read(length).decode() or "{}")
+        except json.JSONDecodeError:
+            self._send("bad json", "text/plain; charset=utf-8", 400)
+            return
+        try:
+            for qid, fields in (payload.get("items") or {}).items():
+                submit_answer(self.server.board_path, qid, fields)
+        except Exception as exc:  # noqa: BLE001
+            self._send(f"提交失败：{exc}", "text/plain; charset=utf-8", 500)
+            return
+        self._send("ok", "text/plain; charset=utf-8")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="one-is-all 任务板")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8792)
+    parser.add_argument("--board", default=DEFAULT_BOARD)
+    parser.add_argument("--interval", type=int, default=6)
+    args = parser.parse_args()
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server.board_path = args.board
+    server.interval = args.interval
+    print(f"one-is-all 看板：http://{args.host}:{args.port}/  board={args.board}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
