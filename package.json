@@ -1,0 +1,17 @@
+{
+  "name": "pi-one-is-all",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Make every Pi session a leader. Dispatch work to one-is-all-member; keep a local task board.",
+  "keywords": ["pi-package"],
+  "type": "module",
+  "license": "MIT",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions/one-is-all.ts"],
+    "skills": ["./skills"]
+  }
+}
